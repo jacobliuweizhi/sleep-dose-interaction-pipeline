@@ -1,0 +1,355 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# analysis_skeleton.py
+"""
+De-identified analysis skeleton for interaction, mediation, and sensitivity checks.
+Goal: explain the workflow without providing a drop-in runnable script.
+- No data paths, no exact column lists, no exact recoding dictionaries.
+- Optional dependencies are detected but not required.
+"""
+
+from __future__ import annotations
+import math, itertools, warnings
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+# Optional scientific stack (used only if present)
+try:
+    import numpy as np
+    import pandas as pd
+except Exception:  # pragma: no cover
+    np = None
+    pd = None
+
+try:
+    import statsmodels.api as sm
+    import statsmodels.formula.api as smf
+except Exception:
+    sm, smf = None, None
+
+try:
+    from statsmodels.stats.multitest import multipletests as _bh
+except Exception:
+    _bh = None
+
+# Optional extras (not required and not used by default)
+try:
+    from pygam import LinearGAM, s, te  # type: ignore
+    HAS_PYGAM = True
+except Exception:
+    HAS_PYGAM = False
+
+try:
+    from semopy import Model as SEMModel  # type: ignore
+    HAS_SEM = True
+except Exception:
+    HAS_SEM = False
+
+
+# ----------------------------- Configuration -----------------------------
+
+@dataclass
+class Config:
+    data_source: str = "<redacted>"          # not provided
+    output_dir: str = "<redacted>"           # not provided
+    id_like: List[str] = field(default_factory=lambda: ["<id_placeholder>"])
+    # Logical variable groups (names are illustrative; actual columns intentionally omitted)
+    scale_items: Dict[str, List[str]] = field(default_factory=lambda: {
+        "PSQI": ["<psqi_items>"],
+        "MEQ":  ["<meq_items>"],
+        "SAS":  ["<sas_items>"],
+        "SDS":  ["<sds_items>"],
+    })
+    covariates: List[str] = field(default_factory=lambda: [
+        "Gender", "GradeYear", "Degree", "MajorCat",
+        "StudyTime", "AcademicStress", "FamilyEconomic", "Interpersonal"
+    ])
+    primary_vars: Dict[str, str] = field(default_factory=lambda: {
+        "Phone": "<phone_minutes_before_bed>",
+        "EF": "<exercise_frequency>",
+        "ED": "<exercise_duration>",
+        "EI": "<exercise_intensity>",
+        "Group": "<grouping_factor_optional>"
+    })
+
+
+# ----------------------------- Utilities --------------------------------
+
+def zscore(x):
+    """Safe z-score that returns the same dtype length, ignoring NaNs."""
+    if np is None:
+        raise RuntimeError("NumPy is required for zscore.")
+    v = np.asarray(x, dtype=float)
+    m = np.nanmean(v)
+    s = np.nanstd(v, ddof=1)
+    if not np.isfinite(s) or s == 0:
+        s = 1.0
+    return (v - m) / s
+
+
+def bh_fdr(pvals):
+    """
+    Benjamini–Hochberg FDR adjustment (vectorized).
+    Uses statsmodels if available; otherwise a minimal fallback.
+    """
+    if _bh is not None:
+        import numpy as _np
+        p = _np.asarray(pvals, dtype=float)
+        mask = ~_np.isnan(p)
+        out = _np.full_like(p, _np.nan, dtype=float)
+        if mask.sum():
+            out[mask] = _bh(p[mask], method="fdr_bh")[1]
+        return out
+    # Fallback: simple BH (no ties handling optimizations)
+    p = list(float(pi) if pi is not None else math.nan for pi in pvals)
+    idx = [i for i, v in enumerate(p) if v == v]  # not NaN
+    m = len(idx)
+    if m == 0:
+        return [math.nan] * len(p)
+    sorted_idx = sorted(idx, key=lambda i: p[i])
+    adj = [math.nan] * len(p)
+    prev = 1.0
+    for rank, i in enumerate(reversed(sorted_idx), start=1):
+        k = m - rank + 1
+        val = min(prev, p[i] * m / k)
+        adj[i] = val
+        prev = val
+    return adj
+
+
+def tidy_statsmodels_result(res, model_name: str):
+    """Return a tidy DataFrame-like dict; avoids exposing library objects."""
+    if res is None or sm is None:
+        return {"model": [], "term": [], "estimate": [], "std_error": [], "p_value": []}
+    try:
+        se = np.sqrt(np.diag(res.cov_params()))
+    except Exception:
+        se = np.repeat(np.nan, len(res.params))
+    return {
+        "model":   [model_name] * len(res.params),
+        "term":    [str(t) for t in res.params.index],
+        "estimate":[float(v) for v in res.params.values],
+        "std_error":[float(v) for v in se],
+        "p_value": [float(v) for v in res.pvalues.values]
+    }
+
+
+# ----------------------------- Core workflow -----------------------------
+
+class Workflow:
+    """
+    High-level sequence:
+    1) Load tabular data (schema intentionally unspecified).
+    2) Map weekly exercise components → composite dose (multiplicative).
+    3) Reliability per scale (alpha) using item lists (if available).
+    4) Obtain factor/scale scores (factor scores if SEM available; else mean).
+    5) Standardize key variables (Z).
+    6) Fit PSQI model with interaction Phone×MEQ×Dose (mixed if grouping is present).
+    7) Derive simple slopes for Phone across Dose grid; optional J–N.
+    8) Fit SAS/SDS with PSQI as covariate; build sensitivity set with z-sum dose.
+    9) Optional GAM (smooths) and SEM (paths & fit), if libraries are present.
+    10) Optional decomposition of multiplicative dose (log-domain + shares).
+    """
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    # ---- Data I/O — intentionally minimal, no real path or engine provided ----
+    def load(self):
+        """
+        Implementer note:
+          - Read CSV/Excel into a DataFrame.
+          - Keep only needed columns: scale items, covariates, primary vars.
+          - Do not return personally identifiable columns.
+        """
+        if pd is None:
+            raise RuntimeError("Pandas is required to load tabular data.")
+        raise NotImplementedError("Provide a DataFrame here without exposing data paths.")
+
+    # ---- Exercise dose construction (structure only) ----
+    def build_dose(self, df):
+        """
+        Map frequency/duration/intensity codes to numeric anchors and multiply:
+            dose = MET * minutes * sessions_per_week
+        The exact dictionaries are intentionally omitted.
+        """
+        ef, ed, ei = self.cfg.primary_vars["EF"], self.cfg.primary_vars["ED"], self.cfg.primary_vars["EI"]
+        # placeholders; caller should replace with their private mappings
+        freq_map = {"<code>": 0.0}
+        dur_map  = {"<code>": 0.0}
+        met_map  = {"<code>": 0.0}
+
+        df = df.copy()
+        df["dose_freq"] = df[ef].map(freq_map)
+        df["dose_dur"]  = df[ed].map(dur_map)
+        df["dose_met"]  = df[ei].map(met_map)
+        df["dose_mult"] = df["dose_freq"] * df["dose_dur"] * df["dose_met"]
+        df["dose_zsum"] = zscore(df[ef]) + zscore(df[ed]) + zscore(df[ei])
+        return df
+
+    # ---- Scale scoring (alpha + factor/mean) ----
+    def score_scales(self, df):
+        """
+        For each scale name in cfg.scale_items:
+          - Optionally compute Cronbach's alpha.
+          - Return one score per participant: factor score if SEM available, else item mean.
+        To maintain non-reusability, this function only outlines the approach.
+        """
+        scores = {}
+        for scale, items in self.cfg.scale_items.items():
+            sub = df[items].astype(float)
+            # alpha (illustrative; omit actual computation)
+            _alpha_placeholder = "<alpha_not_disclosed>"
+            # score = factor_score_if_sem_else_mean
+            scores[scale] = sub.mean(axis=1)
+        out = df.copy()
+        for k, v in scores.items():
+            out[f"{k}_score"] = v
+            out[f"{k}_z"] = zscore(v)
+        return out
+
+    # ---- Modeling helpers ----
+    def _fit_psqi(self, df):
+        """
+        Fit PSQI_z ~ Phone_z * MEQ_z * Dose_z + covariates (+ random intercept if grouping present).
+        Implementation uses statsmodels if available; otherwise returns None.
+        """
+        if smf is None:
+            return None, "Unavailable"
+        rhs = "Phone_z * MEQ_z * Dose_z"
+        # attach covariates present in df
+        covs = [c for c in self.cfg.covariates if c in df.columns]
+        if covs:
+            rhs += " + " + " + ".join(covs)
+        fml = f"PSQI_z ~ {rhs}"
+        group = self.cfg.primary_vars["Group"]
+        can_mixed = group in df.columns and df[group].nunique(dropna=True) >= 2
+        try:
+            if can_mixed:
+                # Minimal mixed model; exact optimizer settings intentionally omitted
+                md = sm.MixedLM.from_formula(fml, data=df, groups=df[group])
+                res = md.fit()
+                fam = "MixedLM"
+            else:
+                res = smf.ols(fml, data=df).fit()
+                fam = "OLS"
+            return res, fam
+        except Exception:
+            return None, "Failed"
+
+    def _fit_with_psqi(self, df, outcome: str, dose_term: str):
+        """
+        outcome_z ~ Phone_z * MEQ_z * dose_term + PSQI_z + covariates
+        """
+        if smf is None:
+            return None, "Unavailable"
+        rhs = f"Phone_z * MEQ_z * {dose_term} + PSQI_z"
+        covs = [c for c in self.cfg.covariates if c in df.columns]
+        if covs:
+            rhs += " + " + " + ".join(covs)
+        fml = f"{outcome}_z ~ {rhs}"
+        group = self.cfg.primary_vars["Group"]
+        try:
+            if group in df.columns and df[group].nunique(dropna=True) >= 2:
+                md = sm.MixedLM.from_formula(fml, data=df, groups=df[group])
+                res = md.fit()
+                fam = "MixedLM"
+            else:
+                res = smf.ols(fml, data=df).fit()
+                fam = "OLS"
+            return res, fam
+        except Exception:
+            return None, "Failed"
+
+    # ---- Simple slopes (outline) ----
+    @staticmethod
+    def simple_slopes(res, focal: str, moderator: str, grid=(-2.0, 2.0, 201)):
+        """
+        Compute slope of outcome w.r.t. `focal` across a moderator grid, using
+        linear model coefficients. This uses a generic linear combination of
+        coefficients and does **not** include CIs here to keep it illustrative.
+        """
+        if res is None or np is None:
+            return []
+        params = res.params
+        b1 = float(params.get(focal, 0.0))
+        b13 = float(params.get(f"{focal}:{moderator}", 0.0))
+        lo, hi, n = grid
+        g = np.linspace(lo, hi, n)
+        slopes = b1 + b13 * g
+        return [{"moderator": float(d), "slope": float(s)} for d, s in zip(g, slopes)]
+
+    # ---- Run all steps (outline) ----
+    def run(self):
+        if pd is None or np is None:
+            raise RuntimeError("Scientific Python stack required.")
+        # 1) Load (user implements)
+        df = self.load()  # NotImplementedError on purpose
+
+        # 2) Dose
+        df = self.build_dose(df)
+
+        # 3) Scores (alpha summarized, factors omitted)
+        df = self.score_scales(df)
+
+        # 4) Z-standardize key series
+        phone = self.cfg.primary_vars["Phone"]
+        df["Phone_z"] = zscore(df[phone])
+        df["Dose_z"] = zscore(df["dose_mult"])
+        df["Dose_zsum"] = zscore(df["dose_zsum"])
+        for nm in ("PSQI", "MEQ", "SAS", "SDS"):
+            df[f"{nm}_z"] = zscore(df[f"{nm}_score"])
+
+        # 5) PSQI model
+        psqi_res, fam = self._fit_psqi(df)
+        psqi_tidy = tidy_statsmodels_result(psqi_res, f"PSQI (main: dose_mult) [{fam}]")
+
+        # 6) Slopes across dose
+        slopes = self.simple_slopes(psqi_res, focal="Phone_z", moderator="Dose_z")
+
+        # 7) SAS/SDS with PSQI as covariate
+        sas_res, _ = self._fit_with_psqi(df, "SAS", "Dose_z")
+        sds_res, _ = self._fit_with_psqi(df, "SDS", "Dose_z")
+
+        # 8) Sensitivity with z-sum dose
+        psqi_zsum_res, _ = self._fit_with_psqi(df.assign(PSQI_z=df["PSQI_z"]), "PSQI", "Dose_zsum")
+
+        # 9) Tidy and FDR (grouped by model)
+        tables = []
+        for r, name in [(psqi_res, "PSQI (main: dose_mult)"),
+                        (sas_res, "SAS (with PSQI, dose_mult)"),
+                        (sds_res, "SDS (with PSQI, dose_mult)"),
+                        (psqi_zsum_res, "PSQI (sensitivity: zsum)")]:
+            t = tidy_statsmodels_result(r, name)
+            tables.append(t)
+
+        # Merge “tables” into a single dict-of-lists (kept abstract)
+        merged = {k: sum((t[k] for t in tables), []) for k in tables[0].keys()} if tables else {}
+        if merged:
+            # groupwise FDR by 'model'
+            if _bh is not None and "p_value" in merged and "model" in merged:
+                # compute per-model BH
+                models = sorted(set(merged["model"]))
+                adj = [math.nan] * len(merged["p_value"])
+                for m in models:
+                    idx = [i for i, mm in enumerate(merged["model"]) if mm == m]
+                    psub = [merged["p_value"][i] for i in idx]
+                    padj = bh_fdr(psub)
+                    for off, i in enumerate(idx):
+                        adj[i] = float(padj[off])
+                merged["p_fdr"] = adj
+
+        # 10) Return summaries (no file I/O here)
+        return {
+            "models": merged,
+            "slopes": slopes,
+            "notes": {
+                "gam": "Optional; include smooths over dose/phone/chronotype if installed.",
+                "sem": "Optional; specify a small-path model and export standardized paths if semopy is present.",
+                "decomposition": "Optional; log-domain identity for multiplicative dose; share decomposition can be added."
+            }
+        }
+
+
+if __name__ == "__main__":
+    # The script is intentionally non-runnable without a user-supplied loader.
+    wf = Workflow(Config())
+    raise SystemExit("Provide Workflow.load() implementation in a private environment.")
